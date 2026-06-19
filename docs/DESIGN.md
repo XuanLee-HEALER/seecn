@@ -956,3 +956,39 @@ flyout hide
 - [ ] flyout 无任何白底;窗口高度贴合 session 数(2 个 ≈ 2 行高,不留大片空白、不裁切)。
 - [ ] Active 会话速率稳定显示 2s 窗口平均(不再瞬时抖成 0);静默(Idle)不显示速率。
 - [ ] `cargo build`/`clippy -D warnings`/`test`/`fmt` 全绿;只动 flyout.html / flyout(mod+windows)/ tray.rs / monitor.rs。
+
+---
+
+## 22. 后台自启:无控制台 + 文件日志 + 计划任务(方案 A)
+
+**不用真 Windows Service**:服务跑在 Session 0、与用户桌面隔离 → 无法显示托盘/浮层。改为「GUI 子系统(无控制台)+ 文件日志 + 计划任务登录自启提权」,**保留托盘 + cc monitor 浮层**,体验是「开机后一直后台跑、无任何窗口」。
+
+### 22.1 无控制台窗口
+
+`src/main.rs` крейт根加:`#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`。
+- **release**:GUI 子系统,无控制台窗口;
+- **debug**:保留控制台(开发时看日志)。
+- GUI 子系统对 tray-icon / tao / wry(WebView2)无影响,照常工作。
+
+### 22.2 文件日志(info+,用户数据目录)
+
+- 目录:`%LOCALAPPDATA%\seecn\logs\`,运行时 `create_dir_all`(无 LOCALAPPDATA 时回退当前目录)。
+- `Cargo.toml` 加 `tracing-appender`(跨平台依赖)。
+- tracing 改造:`tracing_appender::rolling::daily(log_dir, "seecn.log")` **同步写**(不用 `non_blocking`,避免 `process::exit` 丢尾部日志),`with_ansi(false)`(文件不要颜色码),filter 默认 `info`、仍尊重 `RUST_LOG` 覆盖。
+  - **debug**:用 `tracing_subscriber::fmt::writer::MakeWriterExt::and(std::io::stdout)` 同时写控制台 + 文件;
+  - **release**:纯文件(无控制台)。
+- 已有的 **panic hook** 经 tracing → 写进文件,无控制台也能抓到后台线程崩溃。
+
+### 22.3 安装/卸载:计划任务(登录自启 + 最高权限)
+
+- `scripts/install.ps1`(需管理员):建 `%LOCALAPPDATA%\seecn` + `\logs`;把 `..\target\release\seecn.exe` 拷为 `%LOCALAPPDATA%\seecn\seecn.exe`;`Register-ScheduledTask`——触发 `-AtLogOn -User <当前用户>`、Principal `Interactive + RunLevel Highest`、Settings `ExecutionTimeLimit 0`(不限时)`MultipleInstances IgnoreNew`;先停掉在跑实例,再 `Start-ScheduledTask` 立即起。
+- `scripts/uninstall.ps1`:`Stop/Unregister-ScheduledTask` + 停掉运行实例(安装目录/日志保留)。
+- `justfile`:`install`(`cargo build --release` 后 `Start-Process -Verb RunAs ... -File install.ps1`)、`uninstall`(RunAs -File uninstall.ps1)。
+- 任务 `RunLevel Highest` → 登录时自动**以管理员在用户 session 启动**:ETW 三态可用、无需每次 UAC。
+
+### 22.4 验收
+
+- [ ] release(`cargo build --release`)双击或经任务启动:**无控制台窗口**,托盘图标正常出现,左键浮层正常。
+- [ ] 日志写到 `%LOCALAPPDATA%\seecn\logs\seecn.log`(按天滚动),`info` 及以上;debug 构建仍有控制台日志。
+- [ ] `just install`:一次 UAC → 任务注册 + 立即后台启动;注销/重启后自动起。`just uninstall` 干净移除。
+- [ ] `cargo build`/`clippy -D warnings`/`test`/`fmt` 全绿;Rust 侧只动 `main.rs` 与 `Cargo.toml`。

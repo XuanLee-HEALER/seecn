@@ -11,6 +11,10 @@
 //! ETW 的 `NetMonitor::start` 契约要求 `Sender<NetEvent>`,因此用一根 net channel +
 //! 一个 bridge 线程把 `NetEvent` 包成 `EngineMsg::Net` 转投,从而保持 Engine 单入口。
 
+// 无控制台窗口(DESIGN §22.1):release 走 GUI 子系统,无控制台窗口;debug 保留控制台便于看日志。
+// 必须是 crate 级 inner 属性(#![...]),且写在任何 item 之前,否则编译失败。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod flyout;
 mod model;
 mod monitor;
@@ -19,6 +23,7 @@ mod state;
 mod tray;
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -30,10 +35,42 @@ use crate::monitor::{Engine, EngineMsg};
 use crate::tray::UserEvent;
 
 fn main() {
-    // 1. 初始化 tracing(env-filter,默认 info)。
+    // 1. 初始化 tracing:文件日志(info+,用户数据目录)+ debug 下兼写控制台(DESIGN §22.2)。
+    //    日志目录:%LOCALAPPDATA%\seecn\logs\,无 LOCALAPPDATA 时回退当前目录;best-effort 建目录。
+    let log_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("seecn")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&log_dir);
+
+    // 同步 RollingFileAppender:按天滚动写 seecn.log。它实现了 MakeWriter,可直接 with_writer,
+    //   无需 non_blocking + WorkerGuard,从而 process::exit 时不丢尾部日志(DESIGN §22.2)。
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "seecn.log");
+
+    // filter:默认 info,仍尊重 RUST_LOG 覆盖。
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // debug:控制台 + 文件双写(MakeWriterExt::and);release:纯文件(无控制台)。
+    //   两分支都 with_ansi(false):文件不要 ANSI 颜色码。
+    #[cfg(debug_assertions)]
+    {
+        use tracing_subscriber::fmt::writer::MakeWriterExt;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(file_appender.and(std::io::stdout))
+            .init();
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(file_appender)
+            .init();
+    }
 
     info!("seecn 启动:see-claude-network 被动网络状态传感器");
 

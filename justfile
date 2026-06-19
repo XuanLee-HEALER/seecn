@@ -31,3 +31,13 @@ lint:
 # 全量本地校验
 ci: fmt check lint
     cargo build
+
+# 安装为登录自启(管理员;无控制台 + 文件日志 + 最高权限,保留托盘/浮层)。
+# 先 build release,再提权运行 scripts/install.ps1 注册计划任务(弹一次 UAC)。
+install:
+    cargo build --release
+    Start-Process -Verb RunAs -FilePath pwsh -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"{{justfile_directory()}}\scripts\install.ps1"
+
+# 卸载:移除计划任务并停止运行实例(管理员;弹一次 UAC)。
+uninstall:
+    Start-Process -Verb RunAs -FilePath pwsh -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',"{{justfile_directory()}}\scripts\uninstall.ps1"

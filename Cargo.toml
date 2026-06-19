@@ -12,6 +12,7 @@ netstat2 = { version = "0.11.2", optional = true }
 sysinfo = "0.39.3"
 tao = "0.34"
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tray-icon = "0.24"
 wry = "0.53"
