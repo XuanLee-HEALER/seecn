@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>seecn flyout</title>
+<style>
+  /* ── 设计令牌:跨平台共享,改这里即可换肤 ───────────────────────── */
+  :root {
+    --bg: #16161a;
+    --card: #1e1e22;
+    --line: #2a2a30;
+    --fg: #e6e6ea;
+    --muted: #8a8a93;
+    --mono: ui-monospace, "Cascadia Mono", Consolas, "SF Mono", monospace;
+    --offline: #7a7a7a;
+    --idle: #3b82f6;
+    --active: #22c55e;
+    --radius: 12px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%;
+    /* 不透明深色填满整窗:窗口是硬矩形,WebView2 透明不可靠;若用透明背景,
+       窗口默认白底会从卡片圆角/下方缝隙透出来(就是之前看到的白)。 */
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, "Segoe UI", -apple-system, sans-serif;
+    font-size: 13px;
+    -webkit-user-select: none; user-select: none;
+    cursor: default;
+  }
+  /* 面板 full-bleed 填满整个窗口(窗口本身就是这块面板):
+     不再用浮动圆角卡片——窗口不透明且是硬矩形,圆角/外边框只会露出白底缝隙。 */
+  #card {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+    background: var(--bg);
+  }
+  header {
+    display: flex; align-items: center; gap: 8px;
+    /* 固定高度 = Rust HEADER_H(46),与窗口高度预算精确对齐,避免内容撑高导致溢出滚动 */
+    height: 46px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  header .title { font-weight: 600; letter-spacing: .2px; }
+  header .count { color: var(--muted); font-size: 12px; margin-left: auto; }
+  /* 整体状态药丸 */
+  .pill {
+    display: inline-flex; align-items: center; gap: 5px;
+    padding: 2px 8px; border-radius: 999px;
+    font-size: 11px; font-weight: 600;
+    background: var(--card); border: 1px solid var(--line);
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; }
+
+  /* 列表占据 header 之下的剩余空间;session 多到超过窗口时内部滚动(不撑破窗口)。 */
+  ul#list { list-style: none; flex: 1; overflow-y: auto; }
+  li.session {
+    display: flex; align-items: center; gap: 10px;
+    /* 固定高度 = Rust ROW_H(50):box-sizing:border-box 下含 padding/border,
+       内容 align-items:center 垂直居中。≤3 个 session 时 46+n*50 == 内容高,绝不出滚动条。 */
+    height: 50px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  li.session:last-child { border-bottom: none; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .dot.offline { background: var(--offline); }
+  .dot.idle    { background: var(--idle); }
+  .dot.active  { background: var(--active);
+                 box-shadow: 0 0 0 3px color-mix(in srgb, var(--active) 25%, transparent); }
+  .meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+  .meta .pid { font-family: var(--mono); font-size: 13px; }
+  .meta .sub { color: var(--muted); font-size: 11px; }
+  .rate { margin-left: auto; text-align: right; font-family: var(--mono); font-size: 11px; }
+  .rate .down { color: var(--idle); }
+  .rate .up   { color: var(--active); }
+  /* 空态也占一行高(= ROW_H),与"无 session 时窗口给 1 行"对齐,不溢出。 */
+  .empty { height: 50px; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+</style>
+</head>
+<body>
+  <div id="card">
+    <header>
+      <span class="title">cc monitor</span>
+      <span id="overall" class="pill"><span class="dot offline"></span><span class="label">offline</span></span>
+      <span id="count" class="count">0 sessions</span>
+    </header>
+    <ul id="list"></ul>
+  </div>
+
+<script>
+  // ── 数据契约(Rust 端推送的 JSON,字段与 model::Session 对齐)──────────
+  //   { overall: "active"|"idle"|"offline",
+  //     sessions: [ { pid, state, conn_count, rate_in, rate_out, cmdline } ] }
+  // Rust 调 evaluate_script(`window.seecnRender(${json})`) 即可刷新。
+
+  const STATE_LABEL = { active: "Active", idle: "Idle", offline: "Offline" };
+
+  function fmtRate(bps) {
+    bps = bps || 0;
+    if (bps >= 1048576) return (bps / 1048576).toFixed(1) + "MB/s";
+    if (bps >= 1024)    return (bps / 1024).toFixed(1) + "KB/s";
+    return bps + "B/s";
+  }
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function render(data) {
+    data = data || {};
+    const sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    const overall = data.overall || "offline";
+
+    // 顶部整体状态
+    const ov = document.getElementById("overall");
+    ov.querySelector(".dot").className = "dot " + overall;
+    ov.querySelector(".label").textContent = STATE_LABEL[overall] || overall;
+    document.getElementById("count").textContent =
+      sessions.length + (sessions.length === 1 ? " session" : " sessions");
+
+    // 列表
+    const list = document.getElementById("list");
+    list.innerHTML = "";
+    if (sessions.length === 0) {
+      list.appendChild(el("li", "empty", "no Claude sessions"));
+      return;
+    }
+    for (const s of sessions) {
+      const li = el("li", "session");
+      li.appendChild(el("span", "dot " + (s.state || "offline")));
+
+      const meta = el("div", "meta");
+      meta.appendChild(el("span", "pid", "pid " + s.pid));
+      const subText = (STATE_LABEL[s.state] || s.state) + "  ·  " + (s.conn_count || 0) + " conn";
+      meta.appendChild(el("span", "sub", subText));
+      li.appendChild(meta);
+
+      if (s.state === "active") {
+        const rate = el("div", "rate");
+        rate.appendChild(el("span", "down", "↓" + fmtRate(s.rate_in)));
+        rate.appendChild(document.createTextNode("  "));
+        rate.appendChild(el("span", "up", "↑" + fmtRate(s.rate_out)));
+        li.appendChild(rate);
+      }
+      list.appendChild(li);
+    }
+  }
+
+  // 暴露给 Rust(wry evaluate_script)调用的全局入口。
+  window.seecnRender = render;
+
+  // 无数据时的占位渲染(便于直接在浏览器里预览模板)。
+  render({ overall: "idle", sessions: [
+    { pid: 12432, state: "active",  conn_count: 3, rate_in: 3276, rate_out: 1126 },
+    { pid: 16244, state: "idle",    conn_count: 1 },
+    { pid: 17984, state: "offline", conn_count: 0 }
+  ]});
+</script>
+</body>
+</html>

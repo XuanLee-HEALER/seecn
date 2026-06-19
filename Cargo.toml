@@ -1,0 +1,37 @@
+[package]
+name = "seecn"
+version = "0.1.0"
+edition = "2021"
+description = "see-claude-network: passive network status sensor for Claude Code CLI sessions"
+
+[dependencies]
+anyhow = "1.0.102"
+crossbeam-channel = "0.5.15"
+ferrisetw = { version = "1.2.0", optional = true }
+netstat2 = { version = "0.11.2", optional = true }
+sysinfo = "0.39.3"
+tao = "0.34"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tray-icon = "0.24"
+wry = "0.53"
+
+[features]
+default = ["windows-platform"]
+# Windows 平台实现所需的平台专属依赖
+windows-platform = ["dep:ferrisetw", "dep:netstat2"]
+# macOS 占位,本期不实现
+macos-platform = []
+
+[target."cfg(windows)".dependencies]
+# GetForegroundWindow 在 Win32_UI_WindowsAndMessaging feature 下(DESIGN §20.2)。
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Diagnostics_Etw", "Win32_UI_WindowsAndMessaging"] }
+# raw-window-handle:从 tao 窗口取顶层 HWND(flyout 前台轮询 light-dismiss,DESIGN §20)。
+# tao/wry 已传递依赖 rwh 0.6,但只内部以 `rwh_06` 别名使用、不对外再导出,
+# 故显式直接依赖同版本(0.6),才能 `use raw_window_handle::{...}`。
+raw-window-handle = "0.6"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
