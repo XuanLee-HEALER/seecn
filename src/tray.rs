@@ -10,7 +10,7 @@
 //! 只在 run 闭包内创建与使用。
 
 use crate::flyout::{sessions_to_json, FlyoutView};
-use crate::model::{LinkState, Privilege, Session};
+use crate::model::{LinkState, Privilege, Session, TrayAnchor};
 use crate::platform;
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
@@ -23,8 +23,10 @@ pub enum UserEvent {
         sessions: Vec<Session>,
         overall: LinkState,
     },
-    /// 托盘左键单击:切换 flyout 显隐(DESIGN §18.3)。
-    TrayClick,
+    /// 托盘左键单击:显示 flyout,并带上图标屏幕锚点(DESIGN §18.3)。
+    TrayClick {
+        anchor: TrayAnchor,
+    },
     MenuQuit,
 }
 
@@ -186,10 +188,18 @@ pub fn run_tray(
         if let TrayIconEvent::Click {
             button: MouseButton::Left,
             button_state: MouseButtonState::Up,
+            rect,
             ..
         } = event
         {
-            let _ = click_proxy.send_event(UserEvent::TrayClick);
+            // 带上图标屏幕矩形,供 flyout 锚定到图标下方(macOS;Windows 默认忽略)。
+            let anchor = TrayAnchor {
+                x: rect.position.x,
+                y: rect.position.y,
+                width: rect.size.width as f64,
+                height: rect.size.height as f64,
+            };
+            let _ = click_proxy.send_event(UserEvent::TrayClick { anchor });
         }
     }));
 
@@ -238,14 +248,14 @@ pub fn run_tray(
                     f.poll_autohide();
                 }
             }
-            Event::UserEvent(UserEvent::TrayClick) => {
+            Event::UserEvent(UserEvent::TrayClick { anchor }) => {
                 // 托盘左键:幂等显示 flyout(不再 toggle),用缓存 JSON 即时渲染。
                 // 即便一次物理点击产生两次 TrayClick,也只是重复显示,消除双触发闪退(DESIGN §19.1)。
                 tracing::debug!("托盘左键 → 显示 flyout");
                 if let Some(f) = flyout.as_mut() {
+                    // 先记录图标锚点(macOS 据此定位到图标下方;Windows 默认 no-op)。
+                    f.set_anchor(anchor);
                     f.show(&last_json);
-                    // 按当前 session 数自适应窗高(DESIGN §21.2):show 已定位,
-                    // resize_for 改高后会再 position_bottom_right 重锚,锚点正确。
                     f.resize_for(last_count);
                 }
             }

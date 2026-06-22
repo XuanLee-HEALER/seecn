@@ -25,7 +25,14 @@ pub const CONN_GC_TTL: Duration = Duration::from_secs(30);
 /// 下行速率滑动窗口时长(决定 SSE 流识别的平滑度)。窗口桶数 = RATE_WINDOW / EVAL_INTERVAL。
 pub const RATE_WINDOW: Duration = Duration::from_secs(2);
 /// 下行平均速率 ≥ 此阈值(B/s)→ 判定「正在流式接收」(SSE)。**待 e2e 校准**。
+///
+/// 字节口径平台相关,故阈值分平台:Windows ETW 报 TCP payload(keepalive 仅数十 B/s,256 够);
+/// macOS nettop 含协议开销,keepalive 基线**实测 ~850~1300 B/s**,256 会被冲穿、空闲误判 Active,
+/// 故用更高阈值(2048 为占位,待真实 SSE 活跃样本 e2e 校准)。
+#[cfg(not(feature = "macos-platform"))]
 pub const DOWN_RATE_ACTIVE_THRESHOLD: f64 = 256.0;
+#[cfg(feature = "macos-platform")]
+pub const DOWN_RATE_ACTIVE_THRESHOLD: f64 = 2048.0;
 /// 单个评估周期上行字节 ≥ 此阈值 → 判定「刚发出请求」(请求体突发)。**待 e2e 校准**。
 pub const REQUEST_BURST_MIN: u64 = 1024;
 
@@ -101,4 +108,20 @@ pub struct Session {
 pub enum Privilege {
     Elevated, // 管理员,ETW 可用 → 三态
     Standard, // 普通用户,ETW 不可用 → 退化为 Offline/Idle 两态
+}
+
+/// 托盘图标的屏幕矩形(物理像素),供 flyout 锚定到图标附近。
+///
+/// 由 tray 的点击事件(`tray_icon::Rect`)填充,平台无关地经 `FlyoutView::set_anchor`
+/// 传给 flyout。用固定屏幕角落的平台(如 Windows 右下角)可忽略它。
+#[derive(Debug, Clone, Copy)]
+pub struct TrayAnchor {
+    /// 图标矩形左上角 x(物理像素,屏幕坐标)。
+    pub x: f64,
+    /// 图标矩形左上角 y。
+    pub y: f64,
+    /// 图标宽。
+    pub width: f64,
+    /// 图标高。
+    pub height: f64,
 }

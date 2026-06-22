@@ -71,11 +71,11 @@ mod tests {
         assert!(!is_effective_activity(20.0, 0));
     }
 
-    /// SSE 流式响应:下行平均速率较高(如 800 B/s)→ 有效活动(true)。
+    /// SSE 流式响应:下行平均速率明显高于阈值 → 有效活动(true)。
     #[test]
     fn sse_high_down_rate_is_effective() {
-        // 800 B/s ≥ 256.0 → true,即便上行无突发。
-        assert!(is_effective_activity(800.0, 0));
+        // 阈值的 4 倍(平台无关写法,适配 Windows 256 / macOS 2048)→ true,即便上行无突发。
+        assert!(is_effective_activity(DOWN_RATE_ACTIVE_THRESHOLD * 4.0, 0));
     }
 
     /// 上行请求突发:本周期上行字节达阈值(如 4096)→ 有效活动(true)。

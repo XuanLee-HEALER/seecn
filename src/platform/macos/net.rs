@@ -221,13 +221,14 @@ fn run_parse_loop(
 
             let entry = (pid, key);
             seen.insert(entry);
-            // 首见 → Connect(建立连接存在性,支撑 Idle)。
+            // 首见 → 只投 Connect,**丢弃 bin/bout**:nettop -d 对每条连接的第一次输出是累计值
+            // (不是 delta),当 delta 用会被当成巨大增量(实测启动飙到 41 万 B/s)污染速率窗口、
+            // 误判 Active;从第二次出现起才是真 delta。
             if known.insert(entry) {
                 let _ = tx.send(NetEvent::Connect { pid, key });
-            }
-            // 有 delta → Data(支撑 Active)。0/0 不发:连接存在性已由 known 维持,
-            // Engine 对 alive 连接即使静默也不 GC,无需 0 字节事件保活(见 monitor.rs gc)。
-            if bin > 0 || bout > 0 {
+            } else if bin > 0 || bout > 0 {
+                // 已知连接:bin/bout 是真 delta → Data(支撑 Active)。0/0 不发:连接存在性已由
+                // known 维持,Engine 对 alive 连接即使静默也不 GC(见 monitor.rs gc)。
                 let _ = tx.send(NetEvent::Data {
                     pid,
                     key,

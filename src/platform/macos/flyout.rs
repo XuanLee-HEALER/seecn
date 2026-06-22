@@ -10,6 +10,7 @@
 //! 3. activation policy:`new` 里设 `Accessory`(不占 Dock、不抢菜单栏),状态栏 app 标准。
 
 use crate::flyout::{FlyoutView, FLYOUT_HTML};
+use crate::model::TrayAnchor;
 use std::time::{Duration, Instant};
 use tao::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
 use tao::event_loop::EventLoopWindowTarget;
@@ -42,6 +43,8 @@ pub struct MacFlyout {
     visible: bool,
     /// 最近一次 show 的时刻,poll_autohide 据此跳过 DISMISS_GRACE 宽限期。
     shown_at: Option<Instant>,
+    /// 最近一次托盘点击的图标锚点(定位到图标下方);None 时回退右上角。
+    anchor: Option<TrayAnchor>,
 }
 
 impl MacFlyout {
@@ -71,6 +74,7 @@ impl MacFlyout {
             window,
             visible: false,
             shown_at: None,
+            anchor: None,
         })
     }
 
@@ -79,11 +83,9 @@ impl MacFlyout {
         self.window.id()
     }
 
-    /// 定位到主显示器右上角(菜单栏之下,留边距)。
-    ///
-    /// 对称 Windows 的右下角:都落在各自系统状态区所在的屏幕角落。窗口尺寸用 `outer_size()`
-    /// 实时取值,故 resize_for 改高后重锚仍正确。
-    fn position_top_right(&self) {
+    /// 定位窗口:有图标锚点 → 锚到图标正下方(x 居中、clamp 进屏);否则回退右上角
+    /// (对称 Windows 右下角)。窗口尺寸用 `outer_size()` 实时取值,resize_for 改高后重锚仍正确。
+    fn position(&self) {
         let Some(monitor) = self.window.primary_monitor() else {
             return;
         };
@@ -92,16 +94,32 @@ impl MacFlyout {
         let origin: PhysicalPosition<i32> = monitor.position();
         let win: PhysicalSize<u32> = self.window.outer_size();
         let margin = (MARGIN * scale) as i32;
-        let menubar = (MENUBAR_RESERVE * scale) as i32;
 
-        let x = origin.x + size.width as i32 - win.width as i32 - margin;
-        let y = origin.y + menubar;
+        let (x, y) = match self.anchor {
+            // 图标正下方:x 让 flyout 中心对齐图标中心、clamp 到屏内;y 落图标底部下方一点。
+            Some(a) => {
+                let cx = a.x + a.width / 2.0;
+                let want_x = (cx - win.width as f64 / 2.0) as i32;
+                let min_x = origin.x + margin;
+                let max_x = origin.x + size.width as i32 - win.width as i32 - margin;
+                let x = want_x.clamp(min_x, max_x);
+                let y = (a.y + a.height) as i32 + (2.0 * scale) as i32;
+                (x, y)
+            }
+            // 无锚点:右上角(菜单栏之下)。
+            None => {
+                let menubar = (MENUBAR_RESERVE * scale) as i32;
+                let x = origin.x + size.width as i32 - win.width as i32 - margin;
+                let y = origin.y + menubar;
+                (x, y)
+            }
+        };
         self.window.set_outer_position(PhysicalPosition::new(x, y));
     }
 
     /// 内部显示:定位 → 可见 → 抢焦点 → 用最新 json 渲染。幂等(供 trait show 复用)。
     fn show_inner(&mut self, json: &str) {
-        self.position_top_right();
+        self.position();
         self.window.set_visible(true);
         self.window.set_focus();
         self.visible = true;
@@ -140,7 +158,7 @@ impl FlyoutView for MacFlyout {
         let rows = session_count.clamp(1, MAX_ROWS);
         let h = HEADER_H + rows as f64 * ROW_H;
         self.window.set_inner_size(LogicalSize::new(FLYOUT_W, h));
-        self.position_top_right();
+        self.position();
     }
 
     fn is_visible(&self) -> bool {
@@ -163,5 +181,9 @@ impl FlyoutView for MacFlyout {
         if !self.window.is_focused() {
             self.hide();
         }
+    }
+
+    fn set_anchor(&mut self, anchor: TrayAnchor) {
+        self.anchor = Some(anchor);
     }
 }
