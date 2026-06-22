@@ -106,10 +106,14 @@ fn main() {
     // 2. 检测权限,日志提示三态 / 两态。
     let privilege = platform::current_privilege();
     match privilege {
-        Privilege::Elevated => info!("以管理员运行:ETW 可用,启用三态监控(Offline/Idle/Active)"),
-        Privilege::Standard => {
-            warn!("非管理员运行:ETW 不可用,降级为两态(Offline/Idle)模式。如需 Active 实时感知请以管理员重启")
-        }
+        Privilege::Elevated => info!(
+            "{} 监听可用,启用三态监控(Offline/Idle/Active)",
+            platform::monitor_label()
+        ),
+        Privilege::Standard => warn!(
+            "{} 监听不可用,降级为两态(Offline/Idle)模式",
+            platform::monitor_label()
+        ),
     }
 
     // 3. 共享状态与 channel。
@@ -175,9 +179,14 @@ fn main() {
                 .spawn(move || {
                     let mut net_monitor = platform::new_net_monitor();
                     match net_monitor.start(claude_pids_etw, net_tx) {
-                        Ok(()) => info!("ETW KernelNetwork 监听已启动(三态模式)"),
-                        Err(e) => warn!("ETW 监听启动失败,进入两态(Offline/Idle)模式:{:#}", e),
+                        Ok(()) => info!("{} 监听已启动(三态模式)", platform::monitor_label()),
+                        Err(e) => warn!(
+                            "{} 监听启动失败,进入两态(Offline/Idle)模式:{:#}",
+                            platform::monitor_label(),
+                            e
+                        ),
                     }
+
                     // start() 若是阻塞式实现,返回时 trace 已结束;若是非阻塞(内部另起线程),
                     // 本线程在此自然退出,ETW 后台线程随进程存活。两种语义均无需额外处理。
                 })

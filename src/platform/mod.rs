@@ -58,3 +58,22 @@ pub fn current_privilege() -> crate::model::Privilege {
         crate::model::Privilege::Standard
     }
 }
+
+/// 当前平台实时网络监听机制的展示名(用于日志/提示)。
+///
+/// 复用层(main.rs)不应硬编码具体机制;由各平台在此注入,保持复用层平台无关。
+/// Windows = `ETW KernelNetwork`;macOS = `nettop`。
+pub fn monitor_label() -> &'static str {
+    #[cfg(feature = "windows-platform")]
+    {
+        "ETW KernelNetwork"
+    }
+    #[cfg(all(feature = "macos-platform", not(feature = "windows-platform")))]
+    {
+        "nettop"
+    }
+    #[cfg(not(any(feature = "windows-platform", feature = "macos-platform")))]
+    {
+        "网络监听"
+    }
+}
