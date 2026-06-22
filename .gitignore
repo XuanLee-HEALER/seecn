@@ -13,3 +13,6 @@ target/
 # 操作系统
 Thumbs.db
 .DS_Store
+
+# 运行时日志:无 LOCALAPPDATA(macOS)时 main.rs 回退到 cwd 的 ./seecn/logs(待平台化)
+/seecn/
