@@ -39,7 +39,7 @@
 | `tcptable.rs` `MacTcpSnapshot` | tcptable.rs | ✅ |
 | `net.rs` `MacNetMonitor`(nettop) | etw.rs | ✅ |
 | `mod.rs` 构造 + detect_privilege + no-op flyout | mod.rs | ✅ |
-| `flyout.rs` 真状态栏浮层 | flyout.rs | ⏳ 下一阶段 |
+| `flyout.rs` `MacFlyout` 真状态栏浮层 | flyout.rs | ✅ |
 
 接线:`platform/mod.rs` 去掉 `compile_error!` 改 cfg 分发;`Cargo.toml` 的 `macos-platform` 启用 `dep:netstat2`。UI 本期用 no-op flyout 让 `main.rs` 原样编译,三态靠 `RUST_LOG=debug` 日志 + 托盘验证。
 
@@ -94,8 +94,19 @@ sysinfo 跨平台,结构照搬 `WinProcScanner`。命中两步(先 deny 后 allo
 - **nettop 孤儿:不存在**。主进程一死,nettop 的 stdout 读端关闭,它下个采样周期(每秒)写 stdout 即吃 SIGPIPE 自杀。实测 SIGKILL 主进程后 nettop ~1s 内自动消失,无残留、无需主动 kill。
 - **nettop 崩溃自救:监督循环**。`supervise()` 解析当前 nettop 直到流断 → kill+wait 回收 → 退避(1s 指数到 30s 上限,上条若稳定存活过则重置)后重启。实测 SIGKILL nettop 子进程后,主进程 1s 内重启出新 nettop、数据流恢复;崩溃期间 Engine 靠存量连接 + GC 维持。
 
-## 7. 已知项 / 下一阶段
+## 7. flyout — 状态栏浮层(已实现)
 
-- **日志文案**:`main.rs` 复用层写死 "ETW",macOS 实为 nettop;为守"复用层不改"未动,留 UI 阶段统一做平台感知文案。
-- **dead_code warning**:macOS no-op flyout 未用 `FLYOUT_HTML`/`hide`,做真 UI 后自然消失。
-- **下一阶段**:`macos/flyout.rs` 真状态栏 flyout(对应 windows/flyout.rs),把 no-op 换成 wry webview 浮层。
+`MacFlyout`(flyout.rs)照搬 windows/flyout.rs 模式:tao 无边框 + 透明 + always-on-top 窗口,内挂 wry WebView 加载同一个 `FLYOUT_HTML`,`evaluate_script("window.seecnRender(json)")` 渲染;显隐而非销毁,UI 线程独占。
+
+三处 macOS 差异全用 tao 内建 API 在本模块内解决,**零改复用层**:
+- **定位**:右上角(菜单栏下),对称 Windows 的右下角——各自系统状态区所在的屏幕角落,不需要图标 rect。
+- **light-dismiss**:`poll_autohide` 用 `Window::is_focused()` 查询(WKWebView 是 NSView、不夺窗口焦点,焦点可靠);省去 Windows 的 `GetForegroundWindow` 轮询。
+- **activation policy**:`new` 里 `set_activation_policy_at_runtime(Accessory)`(不占 Dock),不碰 main/tray。
+
+可操作性先用独立 demo(`tools/flyout-demo/`)验证:webview IPC 回传证明卡片渲染(264×88、圆角 14px、半透明)、`Focused` 事件触发、`Accessory` 生效。正式集成后主程序 flyout 创建成功、三态不回归、0 warning。
+
+## 8. 已知项 / 下一阶段
+
+- **日志文案**:`main.rs` 复用层写死 "ETW",macOS 实为 nettop;为守"复用层不改"未动,可后续做平台感知文案。
+- **flyout 定位/尺寸**:`MENUBAR_RESERVE` / 行高等是保守初值,待 e2e 微调。
+- **截图视觉验证**:本机 ghostty 未授屏幕录制,flyout 像素级外观靠 demo webview 自验证 + 肉眼确认,未留截图。
