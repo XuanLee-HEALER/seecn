@@ -38,15 +38,22 @@ mod windows;
 pub use windows::{new_flyout, new_net_monitor, new_proc_scanner, new_tcp_snapshot};
 
 #[cfg(all(feature = "macos-platform", not(feature = "windows-platform")))]
-compile_error!("macOS platform not implemented yet");
+mod macos;
 
-/// 检测当前进程是否管理员(Windows 实现见 platform/windows)。
+#[cfg(all(feature = "macos-platform", not(feature = "windows-platform")))]
+pub use macos::{new_flyout, new_net_monitor, new_proc_scanner, new_tcp_snapshot};
+
+/// 检测当前进程权限 / 三态可用性(各平台实现见 platform/<os>)。
 pub fn current_privilege() -> crate::model::Privilege {
     #[cfg(feature = "windows-platform")]
     {
         windows::detect_privilege()
     }
-    #[cfg(not(feature = "windows-platform"))]
+    #[cfg(all(feature = "macos-platform", not(feature = "windows-platform")))]
+    {
+        macos::detect_privilege()
+    }
+    #[cfg(not(any(feature = "windows-platform", feature = "macos-platform")))]
     {
         crate::model::Privilege::Standard
     }

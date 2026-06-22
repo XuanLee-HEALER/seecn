@@ -21,8 +21,9 @@ wry = "0.53"
 default = ["windows-platform"]
 # Windows 平台实现所需的平台专属依赖
 windows-platform = ["dep:ferrisetw", "dep:netstat2"]
-# macOS 占位,本期不实现
-macos-platform = []
+# macOS 平台实现所需的平台专属依赖(net 走 nettop 子进程,无需额外 crate;
+# tcptable 复用跨平台的 netstat2)
+macos-platform = ["dep:netstat2"]
 
 [target."cfg(windows)".dependencies]
 # GetForegroundWindow 在 Win32_UI_WindowsAndMessaging feature 下(DESIGN §20.2)。
