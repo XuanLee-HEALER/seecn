@@ -1,0 +1,14 @@
+[package]
+name = "flyout-demo"
+version = "0.1.0"
+edition = "2021"
+description = "throwaway demo: validate a macOS status-bar flyout (tao + wry + tray-icon)"
+
+[[bin]]
+name = "flyout-demo"
+path = "src/main.rs"
+
+[dependencies]
+tao = "0.34"
+wry = "0.53"
+tray-icon = "0.24"

@@ -1,5 +1,6 @@
 # Rust 构建产物(体积大,不提交;Cargo.lock 对二进制项目要提交,故不忽略)
-/target
+# 通配:根 target 以及 tools/ 下子项目(如 flyout-demo)的 target 一并忽略
+target/
 
 # 备份 / 调试符号
 **/*.rs.bk
