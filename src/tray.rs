@@ -144,6 +144,9 @@ pub fn run_tray(
     // TrayIcon 句柄必须在 event loop 存活期间保持存活,故 move 进 run 闭包。
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // 菜单只在右键弹出:左键留给 flyout(TrayIconEvent::Click → TrayClick)。
+        // tray-icon 默认 menu_on_left_click=true,在 macOS 上左键会直接弹菜单、盖住 flyout。
+        .with_menu_on_left_click(false)
         .with_tooltip(&startup_tooltip)
         .with_icon(icon_for(LinkState::Offline))
         .build()
