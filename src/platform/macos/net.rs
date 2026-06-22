@@ -19,9 +19,37 @@ use std::io::{BufRead, BufReader};
 use std::net::SocketAddr;
 use std::process::{Child, ChildStdout, Command, Stdio};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 /// nettop 采样间隔(秒)。1s 足够支撑三态(ACTIVE_WINDOW=1500ms);窗口平均会抹平阵发。
 const NETTOP_INTERVAL_SECS: &str = "1";
+
+/// nettop 崩溃后的重启退避:初始 1s,指数翻倍到 30s 上限(防持续秒崩 busy-loop)。
+const NETTOP_RESTART_MIN: Duration = Duration::from_secs(1);
+const NETTOP_RESTART_MAX: Duration = Duration::from_secs(30);
+/// 上一条 nettop 存活 ≥ 此时长才崩 → 视为偶发,重置退避快速重起。
+const NETTOP_STABLE: Duration = Duration::from_secs(30);
+
+/// 一个运行中的 nettop 子进程 + 它的 stdout。
+struct NettopProc {
+    child: Child,
+    stdout: ChildStdout,
+}
+
+/// 启动一个常驻 nettop delta 流子进程。
+/// `-n` 数字地址 / `-x` 纯文本(可管道解析)/ `-d` 增量 / `-s` 间隔 / `-l 0` 无限。
+fn spawn_nettop() -> std::io::Result<NettopProc> {
+    let mut child = Command::new("nettop")
+        .args(["-n", "-x", "-d", "-s", NETTOP_INTERVAL_SECS, "-l", "0"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("nettop stdout 不可用"))?;
+    Ok(NettopProc { child, stdout })
+}
 
 /// macOS 实时网络监控器(基于 nettop 常驻流)。
 pub struct MacNetMonitor {}
@@ -44,36 +72,59 @@ impl NetMonitor for MacNetMonitor {
         claude_pids: Arc<RwLock<HashSet<u32>>>,
         tx: Sender<NetEvent>,
     ) -> anyhow::Result<()> {
-        // 常驻 nettop:-n 数字地址 / -x 纯文本(非 curses,可管道解析)/ -d 增量 /
-        // -s 间隔 / -l 0 无限循环。不加 -p:全局监控,解析时按 claude_pids 过滤。
-        let mut child = Command::new("nettop")
-            .args(["-n", "-x", "-d", "-s", NETTOP_INTERVAL_SECS, "-l", "0"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        // 同步起第一个 nettop:失败即返回 Err,让上层据此降级两态(如 PATH 无 nettop)。
+        // 不加 -p:全局监控,解析时按 claude_pids 过滤(贴 ETW 模型,支持 pid 集合动态增减)。
+        let initial = spawn_nettop()
             .map_err(|e| anyhow::anyhow!("启动 nettop 失败(PATH 里有 nettop?): {e}"))?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("无法取得 nettop stdout"))?;
-
-        // 后台线程:阻塞解析 nettop 流并推 NetEvent。线程随进程存活(daemon)。
-        // 已知限制:主进程经 process::exit 硬退出时本线程被强杀、Child::Drop 不 kill 子进程,
-        // 会残留一个孤儿 nettop(TODO:进程级清理 / 启动自愈)。nettop 自身崩溃时流断,
-        // 解析返回后在此 kill+wait 回收,不再重启(降级:proc+snapshot 仍给 Offline/Idle)。
+        // 监督线程:解析当前 nettop 直到它退出,然后退避重启(崩溃自救)。线程随进程存活(daemon)。
+        // 孤儿无需主动清理:主进程一死,nettop 的 stdout 读端关闭,它下个采样周期写 stdout 即吃
+        // SIGPIPE 自杀(实测 SIGKILL 主进程后 nettop ~1s 内自动消失)。
         std::thread::Builder::new()
             .name("seecn-nettop".into())
-            .spawn(move || {
-                let mut child: Child = child;
-                run_parse_loop(stdout, &claude_pids, &tx);
-                let _ = child.kill();
-                let _ = child.wait();
-                tracing::warn!("nettop 流结束,net monitor 退出(降级两态)");
-            })
-            .map_err(|e| anyhow::anyhow!("无法创建 nettop 解析线程: {e}"))?;
+            .spawn(move || supervise(initial, claude_pids, tx))
+            .map_err(|e| anyhow::anyhow!("无法创建 nettop 监督线程: {e}"))?;
 
         Ok(())
+    }
+}
+
+/// 监督循环:解析当前 nettop 直到流断(进程退出/崩溃),kill+wait 回收,退避后重启。
+///
+/// nettop 崩溃**不致命**:本循环自愈重启;重启期间 Engine 靠存量连接 + GC 维持,
+/// proc + snapshot 仍给 Offline/Idle。退避初始 1s 指数到 30s 上限;若上条 nettop 已稳定
+/// 存活(≥STABLE)再崩,视为偶发、重置退避快速重起。
+fn supervise(initial: NettopProc, claude_pids: Arc<RwLock<HashSet<u32>>>, tx: Sender<NetEvent>) {
+    let mut current = initial;
+    let mut backoff = NETTOP_RESTART_MIN;
+
+    loop {
+        let started = Instant::now();
+        // 阻塞解析,直到 nettop 退出(stdout EOF)。
+        run_parse_loop(current.stdout, &claude_pids, &tx);
+        let _ = current.child.kill();
+        let _ = current.child.wait();
+
+        // 稳定运行后才崩 → 偶发,重置退避;短命连崩 → 保持递增退避避免 busy-loop。
+        if started.elapsed() >= NETTOP_STABLE {
+            backoff = NETTOP_RESTART_MIN;
+        }
+        tracing::warn!(backoff_secs = backoff.as_secs(), "nettop 退出,退避后重启");
+
+        // 重启:成功回到解析;失败继续退避重试(daemon 一直尝试)。
+        loop {
+            std::thread::sleep(backoff);
+            backoff = backoff.saturating_mul(2).min(NETTOP_RESTART_MAX);
+            match spawn_nettop() {
+                Ok(next) => {
+                    current = next;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(backoff_secs = backoff.as_secs(), "nettop 重启失败,退避重试: {e}");
+                }
+            }
+        }
     }
 }
 

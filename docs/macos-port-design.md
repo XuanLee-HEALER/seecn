@@ -89,9 +89,13 @@ sysinfo 跨平台,结构照搬 `WinProcScanner`。命中两步(先 deny 后 allo
 - 三态:`state=Active`(down_rate 39 万~56 万 B/s)、`state=Idle`(流量间隙)均如实判出;Offline 因 session 都在跑未触发(预期)。
 - cmdline:改用 `refresh_processes_specifics(.with_cmd/.with_exe)` 后填上 `claude --dangerously-skip-permissions`。
 
-## 6. 已知项 / 下一阶段
+## 6. 健壮性:孤儿 / 崩溃自救(已实测)
 
-- **日志文案**:`main.rs` 复用层写死 "ETW",macOS 实为 nettop;为守"复用层不改"未动,留 UI 阶段连同 flyout 统一做平台感知文案。
-- **nettop 孤儿**:主进程经 `process::exit` 硬退出时残留一个 nettop 子进程(代码已标 TODO)。
+- **nettop 孤儿:不存在**。主进程一死,nettop 的 stdout 读端关闭,它下个采样周期(每秒)写 stdout 即吃 SIGPIPE 自杀。实测 SIGKILL 主进程后 nettop ~1s 内自动消失,无残留、无需主动 kill。
+- **nettop 崩溃自救:监督循环**。`supervise()` 解析当前 nettop 直到流断 → kill+wait 回收 → 退避(1s 指数到 30s 上限,上条若稳定存活过则重置)后重启。实测 SIGKILL nettop 子进程后,主进程 1s 内重启出新 nettop、数据流恢复;崩溃期间 Engine 靠存量连接 + GC 维持。
+
+## 7. 已知项 / 下一阶段
+
+- **日志文案**:`main.rs` 复用层写死 "ETW",macOS 实为 nettop;为守"复用层不改"未动,留 UI 阶段统一做平台感知文案。
 - **dead_code warning**:macOS no-op flyout 未用 `FLYOUT_HTML`/`hide`,做真 UI 后自然消失。
 - **下一阶段**:`macos/flyout.rs` 真状态栏 flyout(对应 windows/flyout.rs),把 no-op 换成 wry webview 浮层。
