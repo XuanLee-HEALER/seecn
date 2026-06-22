@@ -23,7 +23,6 @@ mod state;
 mod tray;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::thread;
 
@@ -36,12 +35,9 @@ use crate::tray::UserEvent;
 
 fn main() {
     // 1. 初始化 tracing:文件日志(info+,用户数据目录)+ debug 下兼写控制台(DESIGN §22.2)。
-    //    日志目录:%LOCALAPPDATA%\seecn\logs\,无 LOCALAPPDATA 时回退当前目录;best-effort 建目录。
-    let log_dir = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("seecn")
-        .join("logs");
+    //    日志根目录由 platform::log_base_dir() 平台化(Win=%LOCALAPPDATA%,macOS=~/Library/Logs,
+    //    取不到回退 cwd),其下拼 seecn/logs;best-effort 建目录。
+    let log_dir = platform::log_base_dir().join("seecn").join("logs");
     let _ = std::fs::create_dir_all(&log_dir);
 
     // 同步 RollingFileAppender:按天滚动写 seecn.log。它实现了 MakeWriter,可直接 with_writer,

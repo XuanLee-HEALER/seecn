@@ -77,3 +77,25 @@ pub fn monitor_label() -> &'static str {
         "网络监听"
     }
 }
+
+/// 日志根目录(其下再拼 `seecn/logs`)。复用层不应硬编码 Windows 的 `LOCALAPPDATA`,
+/// 由各平台注入。Windows = `%LOCALAPPDATA%`;macOS = `~/Library/Logs`;两者取不到时回退 cwd。
+pub fn log_base_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    #[cfg(feature = "windows-platform")]
+    {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(all(feature = "macos-platform", not(feature = "windows-platform")))]
+    {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library").join("Logs"))
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+    #[cfg(not(any(feature = "windows-platform", feature = "macos-platform")))]
+    {
+        PathBuf::from(".")
+    }
+}
