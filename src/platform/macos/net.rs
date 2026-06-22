@@ -121,7 +121,10 @@ fn supervise(initial: NettopProc, claude_pids: Arc<RwLock<HashSet<u32>>>, tx: Se
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(backoff_secs = backoff.as_secs(), "nettop 重启失败,退避重试: {e}");
+                    tracing::warn!(
+                        backoff_secs = backoff.as_secs(),
+                        "nettop 重启失败,退避重试: {e}"
+                    );
                 }
             }
         }
@@ -165,8 +168,11 @@ fn run_parse_loop(
         if first == "time" {
             if in_cycle {
                 // 上周期结束:known 中本周期未见的连接 → 已断开。
-                let gone: Vec<(u32, ConnKey)> =
-                    known.iter().filter(|e| !seen.contains(e)).copied().collect();
+                let gone: Vec<(u32, ConnKey)> = known
+                    .iter()
+                    .filter(|e| !seen.contains(e))
+                    .copied()
+                    .collect();
                 for e in gone {
                     known.remove(&e);
                     let _ = tx.send(NetEvent::Disconnect { pid: e.0, key: e.1 });
@@ -204,8 +210,14 @@ fn run_parse_loop(
             };
             let _iface = fields.next();
             let _state = fields.next();
-            let bin = fields.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            let bout = fields.next().and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            let bin = fields
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            let bout = fields
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
 
             let entry = (pid, key);
             seen.insert(entry);
@@ -226,7 +238,10 @@ fn run_parse_loop(
         } else if let Some(pid) = parse_proc_pid(f2) {
             // 进程行:f2 形如 "2.1.185.<pid>",末段为 pid。更新归属 + 是否 Claude。
             current_pid = Some(pid);
-            current_is_claude = claude_pids.read().map(|g| g.contains(&pid)).unwrap_or(false);
+            current_is_claude = claude_pids
+                .read()
+                .map(|g| g.contains(&pid))
+                .unwrap_or(false);
         }
     }
 }

@@ -127,7 +127,10 @@ mod tests {
     fn desktop_app_bundle_is_excluded() {
         // Desktop 主进程:exe 在 /Applications/Claude.app/ 内,即使无 --type= 也排除。
         let exe = "/applications/claude.app/contents/macos/claude";
-        assert!(is_desktop_or_electron(exe, "/applications/claude.app/contents/macos/claude"));
+        assert!(is_desktop_or_electron(
+            exe,
+            "/applications/claude.app/contents/macos/claude"
+        ));
     }
 
     #[test]
@@ -141,7 +144,10 @@ mod tests {
     fn cli_local_share_is_not_excluded() {
         // CLI 原生安装位 ~/.local/share/claude/versions/.. 且无 --type= → 不排除。
         let exe = "/users/lixuan/.local/share/claude/versions/1.2.3/claude";
-        assert!(!is_desktop_or_electron(exe, "claude --dangerously-skip-permissions"));
+        assert!(!is_desktop_or_electron(
+            exe,
+            "claude --dangerously-skip-permissions"
+        ));
     }
 
     #[test]
