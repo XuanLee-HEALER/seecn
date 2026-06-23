@@ -47,13 +47,10 @@
 ### macOS — Homebrew(推荐)
 
 ```sh
-brew install XuanLee-HEALER/tap/seecn
+brew install --cask XuanLee-HEALER/tap/seecn
 ```
 
-直接 `seecn` 启动,常驻状态栏。**非 root 即跑满三态**(借 nettop 的 entitlement,不像 Windows 要管理员)。
-
-> 二进制未签名,首次打开若被 Gatekeeper 拦,解除隔离即可:
-> `xattr -dr com.apple.quarantine "$(brew --prefix)/bin/seecn"`
+装的是状态栏 app `seecn.app`;从 Launchpad 或 `open -a seecn` 启动,常驻状态栏。**非 root 即跑满三态**(借 nettop 的 entitlement,不像 Windows 要管理员)。cask 已自动去除 quarantine(二进制未签名),首次打开无需手动放行。
 
 ### Windows — 下载 exe(免安装)
 
@@ -61,7 +58,7 @@ brew install XuanLee-HEALER/tap/seecn
 
 ### 手动下载(macOS)
 
-也可从 Releases 下 `seecn-macos.tar.gz`(universal 二进制,Intel + Apple Silicon),解压即用。
+也可从 Releases 下 `seecn-macos.zip`(内含 universal `seecn.app`,Intel + Apple Silicon)。因未签名,首次打开需放行:右键 → 打开,或 `xattr -dr com.apple.quarantine seecn.app`。
 
 ---
 

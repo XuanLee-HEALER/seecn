@@ -6,19 +6,20 @@ on:
     tags:
       - "v*"
 
+# 最小权限:顶层默认只读;只有 release job 提升到写(创建 Release)。
 permissions:
-  contents: write # 创建 Release 需要写权限
+  contents: read
 
 jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       # 默认 feature = windows-platform(ETW + netstat2 + WebView2)。
       - name: Build release
         run: cargo build --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: seecn-windows
           path: target/release/seecn.exe
@@ -26,35 +27,42 @@ jobs:
   build-macos:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: x86_64-apple-darwin,aarch64-apple-darwin
-      # universal 二进制:两架构各编一次再 lipo 合并,Intel + Apple Silicon 通吃。
-      - name: Build universal binary
+      # universal 二进制(Intel + Apple Silicon)→ 组装 .app bundle → zip。
+      - name: Build universal binary and package .app
         run: |
           cargo build --release --no-default-features --features macos-platform --target x86_64-apple-darwin
           cargo build --release --no-default-features --features macos-platform --target aarch64-apple-darwin
           lipo -create -output seecn \
             target/x86_64-apple-darwin/release/seecn \
             target/aarch64-apple-darwin/release/seecn
-          tar -czf seecn-macos.tar.gz seecn
-      - uses: actions/upload-artifact@v4
+          mkdir -p seecn.app/Contents/MacOS
+          cp packaging/macos/Info.plist seecn.app/Contents/Info.plist
+          cp seecn seecn.app/Contents/MacOS/seecn
+          chmod +x seecn.app/Contents/MacOS/seecn
+          ditto -c -k --keepParent seecn.app seecn-macos.zip
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: seecn-macos
-          path: seecn-macos.tar.gz
+          path: seecn-macos.zip
 
   release:
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 仅此 job 需要写权限来创建 Release
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
       - name: Publish release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
+          draft: false
           files: |
             artifacts/seecn-windows/seecn.exe
-            artifacts/seecn-macos/seecn-macos.tar.gz
+            artifacts/seecn-macos/seecn-macos.zip
           generate_release_notes: true
