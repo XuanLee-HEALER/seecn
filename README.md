@@ -42,6 +42,29 @@
 
 ---
 
+## 安装
+
+### macOS — Homebrew(推荐)
+
+```sh
+brew install XuanLee-HEALER/tap/seecn
+```
+
+直接 `seecn` 启动,常驻状态栏。**非 root 即跑满三态**(借 nettop 的 entitlement,不像 Windows 要管理员)。
+
+> 二进制未签名,首次打开若被 Gatekeeper 拦,解除隔离即可:
+> `xattr -dr com.apple.quarantine "$(brew --prefix)/bin/seecn"`
+
+### Windows — 下载 exe(免安装)
+
+从 [Releases](https://github.com/XuanLee-HEALER/seecn/releases) 下 `seecn.exe`,**双击即用**(portable,无需安装)。三态需管理员(右键 → 以管理员身份运行);非管理员自动降级两态。
+
+### 手动下载(macOS)
+
+也可从 Releases 下 `seecn-macos.tar.gz`(universal 二进制,Intel + Apple Silicon),解压即用。
+
+---
+
 ## Windows 实现原理
 
 ### 核心难点:L4 的「字节」 vs L7 的「语义」
@@ -91,13 +114,19 @@
 
 ## 构建
 
-需要 Rust 工具链(开发用 cargo 1.95)。默认 feature 为 `windows-platform`。
+需要 Rust 工具链。默认 feature 为 `windows-platform`;macOS 需关掉默认、启用 `macos-platform`。
 
-```pwsh
-cargo build            # debug
-cargo build --release  # release(opt-level=z + lto + strip,体积优先)
-cargo test             # 平台无关单测(状态机 / JSON 序列化)
+```sh
+# Windows(默认 feature)
+cargo build --release
+
+# macOS(Intel / Apple Silicon)
+cargo build --release --no-default-features --features macos-platform
+
+cargo test  # 平台无关单测(状态机 / JSON 序列化)
 ```
+
+release profile 已开 `opt-level=z + lto + strip`(体积优先)。
 
 装了 [`just`](https://github.com/casey/just) 的话:`just build` / `just release` / `just check` / `just lint` / `just fmt` / `just ci`。
 
@@ -125,22 +154,37 @@ just run    # 或 cargo run
 
 ---
 
-## macOS(即将开发)
+## macOS 实现原理
 
-当前仅 Windows;macOS 在代码里留了 `macos-platform` feature 占位,**架构已为照搬铺好路**:
+已支持(macOS 11+,Apple Silicon / Intel)。**平台无关的核心完全复用**——三态状态机、`(sessions, overall) → JSON` 数据契约、`FlyoutView` trait、`assets/flyout.html` 模板两端通用(`wry` 在 macOS 用 WKWebView,同一份 HTML 浮层);只换了探测与窗口两层 glue。
 
-- **平台无关的核心都已可复用**——三态状态机、`(sessions, overall) → JSON` 数据契约、`FlyoutView` trait、以及 `assets/flyout.html` 显示模板。`wry` 在 macOS 用的是 WKWebView,所以**同一份 HTML 浮层模板两端通用**。
-- macOS 待实现的只有那层平台 glue:
-  - **进程 / 网络探测**:`libproc` / `proc_pid_rusage` 拿进程网络 I/O,或 `Network.framework` / `nettop` 路线(对应 Windows 的 ETW + netstat2)。
-  - **托盘 / 浮层**:`NSStatusItem` + `NSPopover`/`NSPanel` 承载 WKWebView(对应 Windows 的 tray-icon + tao 窗口)。
+### 数据来源:nettop(借 entitlement,无需 root)
 
-数据契约与模板共享,只换探测与窗口这两层,就是 macOS 版的全部工作量。
+macOS 的 per-pid 实时字节走 `nettop` 常驻子进程(`nettop -n -x -d -s 1 -l 0`,逐行解析 delta 流组成 `NetEvent`,对应 Windows 的 ETW)。
+
+- **为什么不直连内核**:per-pid 字节的内核源是私有 `com.apple.network.statistics`(ntstat)control socket,直连订阅需 Apple **私有** entitlement `com.apple.private.network.statistics`(未签名二进制实测对 `ADD_ALL_SRCS` 一律 `ENOENT`)。`nettop` 自带该 entitlement,故借它——等于借 nettop 拿 ntstat 的推送数据,**非 root 即可跑满三态**(不像 Windows ETW 必须管理员)。
+- **健壮性**:nettop 崩溃由监督循环退避重启(1s 指数到 30s 上限);主进程退出时 nettop 因 stdout 读端关闭吃 SIGPIPE 自动消失,**无孤儿残留**。
+- **进程隔离**:`comm=="claude"` 命中原生 CLI;`/Applications/Claude.app/` 路径 + `--type=` 两道 deny 闸排除 Desktop / Electron。连接快照走跨平台的 `netstat2`。
+
+### 托盘 / 浮层
+
+`tray-icon`(NSStatusItem)+ `tao` 无边框透明窗口 + `wry`(WKWebView),复用同一份 `flyout.html`。三处 macOS 差异都用 tao 内建 API 在平台层内解决、**零改复用层**:
+
+- **定位**:flyout 锚定到状态栏图标正下方(`TrayIconEvent::Click.rect`)。
+- **light-dismiss**:`Window::is_focused()` 查询即可(WKWebView 是 NSView、不夺窗口焦点,比 Windows 的 `GetForegroundWindow` 轮询更省心)。
+- **不占 Dock**:`set_activation_policy(Accessory)`,状态栏 app 标准形态。
+
+### 三态阈值的平台差异
+
+nettop 的字节口径含协议开销,keepalive 基线比 Windows ETW 的 payload 口径高(实测 ~850–1300 B/s vs 数十 B/s),故 `DOWN_RATE_ACTIVE_THRESHOLD` 按平台分(Windows 256 / macOS 2048,后者待真实 SSE 流量 e2e 校准)。
+
+> macOS 实现设计见 `docs/macos-port-design.md`。
 
 ---
 
 ## 已知限制
 
-- **三态依赖管理员权限**:非管理员只有两态(无 Active),是 ETW 的硬性要求,无法绕过。
+- **三态在 Windows 依赖管理员权限**:Windows 上非管理员只有两态(无 Active),是 ETW 的硬性要求;**macOS 借 nettop 的 entitlement,非 root 即三态**。
 - **进程匹配是启发式的**:按可执行名 + 命令行子串匹配,「宁缺毋滥」;极端命名下可能漏判 / 误判,命中与排除都会写 debug 日志便于校准(`RUST_LOG=seecn=debug`)。
 - **L7 逼近不是精确还原**:不解密 TLS 就只能用 L4 特征逼近「是否在请求 / 流式」;阈值需按实际环境校准(`src/model.rs` 的 `DOWN_RATE_ACTIVE_THRESHOLD` / `REQUEST_BURST_MIN`)。
 - **ETW 连接四元组可能不精确**:不同 Windows 版本的 KernelNetwork schema 形态不一,地址 / 端口解析为「尽力而为」——设计上**「能判断三态」是硬目标,连接键精确度是次要目标**。
