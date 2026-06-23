@@ -1,0 +1,60 @@
+name: release
+
+# 打 v* tag 时触发:各平台 runner 原生编译,产物汇总到一个 GitHub Release。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # 创建 Release 需要写权限
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # 默认 feature = windows-platform(ETW + netstat2 + WebView2)。
+      - name: Build release
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seecn-windows
+          path: target/release/seecn.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin,aarch64-apple-darwin
+      # universal 二进制:两架构各编一次再 lipo 合并,Intel + Apple Silicon 通吃。
+      - name: Build universal binary
+        run: |
+          cargo build --release --no-default-features --features macos-platform --target x86_64-apple-darwin
+          cargo build --release --no-default-features --features macos-platform --target aarch64-apple-darwin
+          lipo -create -output seecn \
+            target/x86_64-apple-darwin/release/seecn \
+            target/aarch64-apple-darwin/release/seecn
+          tar -czf seecn-macos.tar.gz seecn
+      - uses: actions/upload-artifact@v4
+        with:
+          name: seecn-macos
+          path: seecn-macos.tar.gz
+
+  release:
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/seecn-windows/seecn.exe
+            artifacts/seecn-macos/seecn-macos.tar.gz
+          generate_release_notes: true
