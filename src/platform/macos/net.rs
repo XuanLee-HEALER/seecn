@@ -1,57 +1,32 @@
-//! `MacNetMonitor`:借 `nettop` 常驻子进程取 per-pid 实时字节(对应 windows/etw.rs)。
+//! `MacNetMonitor`:轮询 `nettop` 单次快照取 per-pid 实时字节(对应 windows/etw.rs)。
 //!
-//! 为什么不直连 ntstat:macOS 的 per-pid 字节源是私有 `com.apple.network.statistics`
-//! (ntstat)kernel control,直连订阅需 Apple 私有 entitlement
-//! `com.apple.private.network.statistics`。本机实测:未签名二进制对 `ADD_ALL_SRCS` 一律
-//! `ENOENT`;`nettop` 自带该 entitlement(codesign 实证)。故借 nettop:fork 一个常驻
-//! `nettop -d`(delta 模式)进程,逐行解析 stdout → 组 NetEvent。等价于 ETW 回调推送:
-//! nettop 内部即订阅 ntstat 的推送封装,delta 由它算好。
+//! **为什么不直连 ntstat**:per-pid 字节的内核源是私有 `com.apple.network.statistics`,
+//! 直连订阅需 Apple 私有 entitlement(未签名二进制实测 `ENOENT`);`nettop` 自带该 entitlement。
 //!
-//! 数据映射(与 etw.rs 同语义):连接行四元组 → ConnKey;本周期 delta 字节 → Data;
-//! 连接首见 → Connect;周期间消失 → Disconnect。pid 过滤走共享 `claude_pids`(同 ETW 模型),
-//! 因此不加 `-p`(全局监控 + 解析时按 pid 过滤),天然适应 Claude 进程集合的动态增减。
+//! **为什么轮询而非持续流**:`nettop -x -l 0`(持续 logging)在两次采样的间隔里 **busy-spin**
+//! ——实测无论 `-s 1` 还是 `-s 5` 都烧满 ~140% CPU(它压根没 sleep)。改用每 `POLL_INTERVAL`
+//! fork 一次 `nettop -l 1`(单次快照,实测 ~40ms 就退出、不空转),自己维护上次累计算 delta,
+//! 再由我们 `thread::sleep` 真正休眠,占空比 ~4%。pid 过滤靠 `-p <claude pids>`,每轮用最新
+//! 集合,天然支持进程动态增减。
+//!
+//! 数据映射(与 etw.rs 同语义):连接行四元组 → ConnKey;累计差 → Data;首见 → Connect;
+//! 轮次间消失 → Disconnect。
 
 use crate::model::{ConnKey, NetEvent};
 use crate::platform::NetMonitor;
 use crossbeam_channel::Sender;
-use std::collections::HashSet;
-use std::io::{BufRead, BufReader};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-/// nettop 采样间隔(秒)。1s 足够支撑三态(ACTIVE_WINDOW=1500ms);窗口平均会抹平阵发。
-const NETTOP_INTERVAL_SECS: &str = "1";
+/// 轮询采样间隔。每轮只 fork 一次 `nettop -l 1`(~40ms),其余时间真 sleep。
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// nettop 命令失败时的退避(防持续出错时 busy 重试)。
+const ERROR_BACKOFF: Duration = Duration::from_secs(5);
 
-/// nettop 崩溃后的重启退避:初始 1s,指数翻倍到 30s 上限(防持续秒崩 busy-loop)。
-const NETTOP_RESTART_MIN: Duration = Duration::from_secs(1);
-const NETTOP_RESTART_MAX: Duration = Duration::from_secs(30);
-/// 上一条 nettop 存活 ≥ 此时长才崩 → 视为偶发,重置退避快速重起。
-const NETTOP_STABLE: Duration = Duration::from_secs(30);
-
-/// 一个运行中的 nettop 子进程 + 它的 stdout。
-struct NettopProc {
-    child: Child,
-    stdout: ChildStdout,
-}
-
-/// 启动一个常驻 nettop delta 流子进程。
-/// `-n` 数字地址 / `-x` 纯文本(可管道解析)/ `-d` 增量 / `-s` 间隔 / `-l 0` 无限。
-fn spawn_nettop() -> std::io::Result<NettopProc> {
-    let mut child = Command::new("nettop")
-        .args(["-n", "-x", "-d", "-s", NETTOP_INTERVAL_SECS, "-l", "0"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("nettop stdout 不可用"))?;
-    Ok(NettopProc { child, stdout })
-}
-
-/// macOS 实时网络监控器(基于 nettop 常驻流)。
+/// macOS 实时网络监控器(基于 nettop 单次快照轮询)。
 pub struct MacNetMonitor {}
 
 impl MacNetMonitor {
@@ -72,130 +47,113 @@ impl NetMonitor for MacNetMonitor {
         claude_pids: Arc<RwLock<HashSet<u32>>>,
         tx: Sender<NetEvent>,
     ) -> anyhow::Result<()> {
-        // 同步起第一个 nettop:失败即返回 Err,让上层据此降级两态(如 PATH 无 nettop)。
-        // 不加 -p:全局监控,解析时按 claude_pids 过滤(贴 ETW 模型,支持 pid 集合动态增减)。
-        let initial = spawn_nettop()
-            .map_err(|e| anyhow::anyhow!("启动 nettop 失败(PATH 里有 nettop?): {e}"))?;
+        // 同步试一次(空 pid 也能跑):失败即返回 Err,让上层降级两态(如 PATH 无 nettop)。
+        nettop_snapshot(&[])
+            .map_err(|e| anyhow::anyhow!("nettop 不可用(PATH 里有 nettop?): {e}"))?;
 
-        // 监督线程:解析当前 nettop 直到它退出,然后退避重启(崩溃自救)。线程随进程存活(daemon)。
-        // 孤儿无需主动清理:主进程一死,nettop 的 stdout 读端关闭,它下个采样周期写 stdout 即吃
-        // SIGPIPE 自杀(实测 SIGKILL 主进程后 nettop ~1s 内自动消失)。
+        // 轮询线程随进程存活(daemon)。无 -l 0 持续流,故无 busy-spin、也无子进程长驻孤儿。
         std::thread::Builder::new()
             .name("seecn-nettop".into())
-            .spawn(move || supervise(initial, claude_pids, tx))
-            .map_err(|e| anyhow::anyhow!("无法创建 nettop 监督线程: {e}"))?;
+            .spawn(move || poll_loop(claude_pids, tx))
+            .map_err(|e| anyhow::anyhow!("无法创建 nettop 轮询线程: {e}"))?;
 
         Ok(())
     }
 }
 
-/// 监督循环:解析当前 nettop 直到流断(进程退出/崩溃),kill+wait 回收,退避后重启。
-///
-/// nettop 崩溃**不致命**:本循环自愈重启;重启期间 Engine 靠存量连接 + GC 维持,
-/// proc + snapshot 仍给 Offline/Idle。退避初始 1s 指数到 30s 上限;若上条 nettop 已稳定
-/// 存活(≥STABLE)再崩,视为偶发、重置退避快速重起。
-fn supervise(initial: NettopProc, claude_pids: Arc<RwLock<HashSet<u32>>>, tx: Sender<NetEvent>) {
-    let mut current = initial;
-    let mut backoff = NETTOP_RESTART_MIN;
+/// 跑一次 `nettop -n -x -l 1 -p <pids>`,阻塞到命令结束(~40ms),返回 stdout 文本。
+fn nettop_snapshot(pids: &[u32]) -> std::io::Result<String> {
+    let mut cmd = Command::new("nettop");
+    cmd.args(["-n", "-x", "-l", "1"]);
+    for &pid in pids {
+        cmd.arg("-p").arg(pid.to_string());
+    }
+    let out = cmd.output()?;
+    if !out.status.success() {
+        return Err(std::io::Error::other(format!(
+            "nettop 退出码 {:?}",
+            out.status.code()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// 轮询循环:每 `POLL_INTERVAL` 拍一次快照、算 delta、推 NetEvent,然后真 sleep。
+fn poll_loop(claude_pids: Arc<RwLock<HashSet<u32>>>, tx: Sender<NetEvent>) {
+    // (pid, key) → 上次累计 (in, out),用于算 delta。
+    let mut prev: HashMap<(u32, ConnKey), (u64, u64)> = HashMap::new();
+    // 当前活跃连接集(已发 Connect、未发 Disconnect)。
+    let mut known: HashSet<(u32, ConnKey)> = HashSet::new();
 
     loop {
-        let started = Instant::now();
-        // 阻塞解析,直到 nettop 退出(stdout EOF)。
-        run_parse_loop(current.stdout, &claude_pids, &tx);
-        let _ = current.child.kill();
-        let _ = current.child.wait();
+        let pids: Vec<u32> = match claude_pids.read() {
+            Ok(g) => g.iter().copied().collect(),
+            Err(_) => Vec::new(), // 锁中毒:本轮当作无 pid,保守跳过
+        };
 
-        // 稳定运行后才崩 → 偶发,重置退避;短命连崩 → 保持递增退避避免 busy-loop。
-        if started.elapsed() >= NETTOP_STABLE {
-            backoff = NETTOP_RESTART_MIN;
+        // 无 Claude 进程:把存量连接全 Disconnect、清状态,sleep 后下轮再看。
+        if pids.is_empty() {
+            for e in known.drain() {
+                let _ = tx.send(NetEvent::Disconnect { pid: e.0, key: e.1 });
+            }
+            prev.clear();
+            std::thread::sleep(POLL_INTERVAL);
+            continue;
         }
-        tracing::warn!(backoff_secs = backoff.as_secs(), "nettop 退出,退避后重启");
 
-        // 重启:成功回到解析;失败继续退避重试(daemon 一直尝试)。
-        loop {
-            std::thread::sleep(backoff);
-            backoff = backoff.saturating_mul(2).min(NETTOP_RESTART_MAX);
-            match spawn_nettop() {
-                Ok(next) => {
-                    current = next;
-                    break;
+        match nettop_snapshot(&pids) {
+            Ok(text) => {
+                let seen = process_snapshot(&text, &mut prev, &mut known, &tx);
+                // known 中本轮未见的连接 → 已断开。
+                let gone: Vec<(u32, ConnKey)> = known.difference(&seen).copied().collect();
+                for e in gone {
+                    known.remove(&e);
+                    prev.remove(&e);
+                    let _ = tx.send(NetEvent::Disconnect { pid: e.0, key: e.1 });
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        backoff_secs = backoff.as_secs(),
-                        "nettop 重启失败,退避重试: {e}"
-                    );
-                }
+                std::thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                tracing::warn!("nettop 快照失败,退避后重试: {e}");
+                std::thread::sleep(ERROR_BACKOFF);
             }
         }
     }
 }
 
-/// 解析 nettop `-x -d` 的流。状态机维护「当前进程行归属的 pid」与「跨周期已知连接集」,
-/// 据此产出 Connect(首见)/ Data(有 delta)/ Disconnect(周期间消失)。
-fn run_parse_loop(
-    stdout: ChildStdout,
-    claude_pids: &Arc<RwLock<HashSet<u32>>>,
+/// 解析单次快照:进程行更新归属 pid,连接行用累计差产出 Connect/Data。返回本轮见到的连接集。
+///
+/// 因 `-p` 已把输出锁定在 Claude 进程,无需再按 pid 过滤;仍解析进程行以归属连接。
+fn process_snapshot(
+    text: &str,
+    prev: &mut HashMap<(u32, ConnKey), (u64, u64)>,
+    known: &mut HashSet<(u32, ConnKey)>,
     tx: &Sender<NetEvent>,
-) {
-    let reader = BufReader::new(stdout);
-
-    let mut current_pid: Option<u32> = None;
-    let mut current_is_claude = false;
-    // 当前活跃连接集(已发过 Connect、未发 Disconnect)。
-    let mut known: HashSet<(u32, ConnKey)> = HashSet::new();
-    // 本采样周期见到的连接集(与 known diff 出已消失的 → Disconnect)。
+) -> HashSet<(u32, ConnKey)> {
     let mut seen: HashSet<(u32, ConnKey)> = HashSet::new();
-    let mut in_cycle = false;
+    let mut current_pid: Option<u32> = None;
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // 流读出错 = nettop 退出
-        };
+    for line in text.lines() {
         let trimmed = line.trim_start();
         if trimmed.is_empty() {
             continue;
         }
-
         let mut fields = trimmed.split_whitespace();
         let first = match fields.next() {
             Some(f) => f,
             None => continue,
         };
-
-        // 表头行(每周期一行,首字段字面 "time"):周期边界。
         if first == "time" {
-            if in_cycle {
-                // 上周期结束:known 中本周期未见的连接 → 已断开。
-                let gone: Vec<(u32, ConnKey)> = known
-                    .iter()
-                    .filter(|e| !seen.contains(e))
-                    .copied()
-                    .collect();
-                for e in gone {
-                    known.remove(&e);
-                    let _ = tx.send(NetEvent::Disconnect { pid: e.0, key: e.1 });
-                }
-            }
-            seen.clear();
-            current_pid = None;
-            current_is_claude = false;
-            in_cycle = true;
-            continue;
+            continue; // 表头行
         }
-
-        // 数据行:first 是时间戳(已消费);下一字段区分进程行 / 连接行。
+        // 数据行:first 是时间戳;下一字段区分进程行 / 连接行。
         let f2 = match fields.next() {
             Some(f) => f,
             None => continue,
         };
 
         if f2.starts_with("tcp") {
-            // 连接行:tcp4/tcp6 LOCAL<->REMOTE iface state bytes_in bytes_out ...
-            if !current_is_claude {
-                continue;
-            }
+            // 连接行:tcp4/tcp6 LOCAL<->REMOTE iface state cum_in cum_out ...
             let pid = match current_pid {
                 Some(p) => p,
                 None => continue,
@@ -206,54 +164,54 @@ fn run_parse_loop(
             };
             let key = match parse_conn_key(addrs) {
                 Some(k) => k,
-                None => continue, // 尽力而为:解析失败跳过该行,不 panic
+                None => continue, // 尽力而为:解析失败跳过该行
             };
             let _iface = fields.next();
             let _state = fields.next();
-            let bin = fields
+            let cum_in = fields
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            let bout = fields
+            let cum_out = fields
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
 
             let entry = (pid, key);
             seen.insert(entry);
-            // 首见 → 只投 Connect,**丢弃 bin/bout**:nettop -d 对每条连接的第一次输出是累计值
-            // (不是 delta),当 delta 用会被当成巨大增量(实测启动飙到 41 万 B/s)污染速率窗口、
-            // 误判 Active;从第二次出现起才是真 delta。
             if known.insert(entry) {
+                // 首见:发 Connect,记累计基线;本轮不发 Data(delta 未知)。
                 let _ = tx.send(NetEvent::Connect { pid, key });
-            } else if bin > 0 || bout > 0 {
-                // 已知连接:bin/bout 是真 delta → Data(支撑 Active)。0/0 不发:连接存在性已由
-                // known 维持,Engine 对 alive 连接即使静默也不 GC(见 monitor.rs gc)。
-                let _ = tx.send(NetEvent::Data {
-                    pid,
-                    key,
-                    inbound: bin,
-                    outbound: bout,
-                });
+                prev.insert(entry, (cum_in, cum_out));
+            } else {
+                // 已知:算 delta(饱和减防连接重建后累计回绕),更新基线;>0 才发 Data。
+                let (p_in, p_out) = prev.get(&entry).copied().unwrap_or((cum_in, cum_out));
+                let d_in = cum_in.saturating_sub(p_in);
+                let d_out = cum_out.saturating_sub(p_out);
+                prev.insert(entry, (cum_in, cum_out));
+                if d_in > 0 || d_out > 0 {
+                    let _ = tx.send(NetEvent::Data {
+                        pid,
+                        key,
+                        inbound: d_in,
+                        outbound: d_out,
+                    });
+                }
             }
         } else if let Some(pid) = parse_proc_pid(f2) {
-            // 进程行:f2 形如 "2.1.185.<pid>",末段为 pid。更新归属 + 是否 Claude。
             current_pid = Some(pid);
-            current_is_claude = claude_pids
-                .read()
-                .map(|g| g.contains(&pid))
-                .unwrap_or(false);
         }
     }
+
+    seen
 }
 
 /// 解析进程行第二字段 "a.b.c.<pid>" 末段为 pid。
-/// (连接行已在调用点用 "tcp" 前缀分流,不会进到这里。)
 fn parse_proc_pid(f: &str) -> Option<u32> {
     f.rsplit('.').next()?.parse::<u32>().ok()
 }
 
-/// 解析 "LOCAL<->REMOTE" 为 ConnKey。LOCAL/REMOTE 为 `ip:port`(IPv4)或 `[ip]:port`(IPv6)。
+/// 解析 "LOCAL<->REMOTE" 为 ConnKey(`ip:port`)。
 fn parse_conn_key(s: &str) -> Option<ConnKey> {
     let (l, r) = s.split_once("<->")?;
     Some(ConnKey {
