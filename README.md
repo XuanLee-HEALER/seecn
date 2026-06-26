@@ -157,10 +157,10 @@ just run    # 或 cargo run
 
 ### 数据来源:nettop(借 entitlement,无需 root)
 
-macOS 的 per-pid 实时字节走 `nettop` 常驻子进程(`nettop -n -x -d -s 1 -l 0`,逐行解析 delta 流组成 `NetEvent`,对应 Windows 的 ETW)。
+macOS 的 per-pid 实时字节走 `nettop` **单次快照轮询**(每秒 fork 一次 `nettop -n -x -l 1 -p <claude pids>`,解析累计字节、自己算 delta 组成 `NetEvent`,对应 Windows 的 ETW)。
 
 - **为什么不直连内核**:per-pid 字节的内核源是私有 `com.apple.network.statistics`(ntstat)control socket,直连订阅需 Apple **私有** entitlement `com.apple.private.network.statistics`(未签名二进制实测对 `ADD_ALL_SRCS` 一律 `ENOENT`)。`nettop` 自带该 entitlement,故借它——等于借 nettop 拿 ntstat 的推送数据,**非 root 即可跑满三态**(不像 Windows ETW 必须管理员)。
-- **健壮性**:nettop 崩溃由监督循环退避重启(1s 指数到 30s 上限);主进程退出时 nettop 因 stdout 读端关闭吃 SIGPIPE 自动消失,**无孤儿残留**。
+- **轻量 + 健壮**:轮询而非持续流——`nettop -x -l 0` 在采样间隔会 busy-spin 烧满核,改用每秒一次 `-l 1` 单次快照(~40ms)后 seecn **实测 ~1% CPU**;每次快照独立、无常驻子进程,故无孤儿,某轮失败下轮重试即可。
 - **进程隔离**:`comm=="claude"` 命中原生 CLI;`/Applications/Claude.app/` 路径 + `--type=` 两道 deny 闸排除 Desktop / Electron。连接快照走跨平台的 `netstat2`。
 
 ### 托盘 / 浮层

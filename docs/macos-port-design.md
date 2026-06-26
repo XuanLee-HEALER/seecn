@@ -61,17 +61,21 @@ sysinfo 跨平台,结构照搬 `WinProcScanner`。命中两步(先 deny 后 allo
 | CLI 的 claude code | 独立 `claude` 进程 | 172.19.0.1 / utun10 | ✅ |
 | Desktop 的 claude code | Claude.app 的 NetworkService(单一 pid 如 65594) | 192.168.77.81 / en0 | ❌ |
 
-两道闸保证 Desktop 永不混入:① proc.rs 把 Claude.app 全部进程 deny,不进 `claude_pids`;② net.rs 全局跑 nettop,但解析每条连接行时按其归属进程行的 pid 查 `claude_pids`,Desktop 的 pid 不在集合 → 直接丢弃、**不组事件**。即便两者都在跑 claude code,也因 pid 不同天然分离(实测:CLI 走 utun10、Desktop 走 en0,零重叠)。
+两道闸保证 Desktop 永不混入:① proc.rs 把 Claude.app 全部进程 deny,不进 `claude_pids`;② net.rs 每轮用 `-p <仅 Claude pid>` 锁定 nettop,只采 Claude 进程,Desktop 的 pid 不在 -p 列表、**连采都不采**。即便两者都在跑 claude code,也因 pid 不同天然分离(实测:CLI 走 utun10、Desktop 走 en0,零重叠)。
 
-## 3. net.rs — nettop 常驻流 → NetEvent
+## 3. net.rs — nettop 单次快照轮询 → NetEvent
 
-`MacNetMonitor::start` fork 一个常驻 `nettop -n -x -d -s 1 -l 0`(数字地址 / 纯文本 / delta / 1s 间隔 / 无限),后台线程逐行解析 stdout:
+> ⚠️ 原设计是 `nettop -l 0` 持续流,但实测 `nettop -x` 在采样间隔里 **busy-spin**(`-s 5` 也烧满核 ~138% CPU、根本没 sleep)。改为**单次快照轮询**:`nettop -l 1` 实测 ~40ms 退出、不空转,每秒 fork 一次、占空比实测 ~1%。
 
-- **表头行**(首字段 `time`)= 采样周期边界:周期末 diff `known` vs 本周期 `seen`,消失的连接 → `Disconnect`。
-- **进程行**(`a.b.c.<pid>`,pid 在末段):更新"当前归属 pid" + 查 `claude_pids` 决定是否关心。
-- **连接行**(`tcp4 LOCAL<->REMOTE iface state bin bout`):归属当前 pid;四元组 → `ConnKey`;首见 → `Connect`;`bin/bout`(delta)>0 → `Data{inbound,outbound}`。0/0 不发(Engine 对 alive 连接不 GC,无需保活事件)。
+`MacNetMonitor::start` 起轮询线程,每 `POLL_INTERVAL`(1s):
 
-与 ETW 同契约:`Connect`/`Data`(增量)/`Disconnect` 经 `tx` 推送,pid 过滤走共享 `claude_pids`。解析全程尽力而为、失败跳过、不 panic。
+1. 取当前 `claude_pids` → `Command::output()` 跑 `nettop -n -x -l 1 -p <pids>`(单次快照,阻塞到结束)。`-p` 锁定 Claude 进程,每轮取最新集合 → 支持动态增减,也不再扫全系统连接。
+2. 解析快照:进程行更新归属 pid;连接行 `tcp4 LOCAL<->REMOTE iface state cum_in cum_out` → `ConnKey` + **累计**字节。
+3. 自己算 delta:维护 `(pid,key) → 上次累计`;首见发 `Connect` 记基线、本轮不发 Data;已知则 `cum - prev`(饱和减防回绕)>0 发 `Data{inbound,outbound}`。
+4. 本轮 `seen` 与 `known` diff,消失的连接 → `Disconnect`。
+5. `thread::sleep(POLL_INTERVAL)` **真正休眠**(关键:不依赖 nettop 的 busy 间隔)。
+
+与 ETW 同契约:`Connect`/`Data`(增量)/`Disconnect` 经 `tx` 推送。解析全程尽力而为、失败跳过、不 panic。
 
 ## 4. 接线与权限
 
@@ -89,10 +93,12 @@ sysinfo 跨平台,结构照搬 `WinProcScanner`。命中两步(先 deny 后 allo
 - 三态:`state=Active`(down_rate 39 万~56 万 B/s)、`state=Idle`(流量间隙)均如实判出;Offline 因 session 都在跑未触发(预期)。
 - cmdline:改用 `refresh_processes_specifics(.with_cmd/.with_exe)` 后填上 `claude --dangerously-skip-permissions`。
 
-## 6. 健壮性:孤儿 / 崩溃自救(已实测)
+## 6. 健壮性 + CPU(已实测)
 
-- **nettop 孤儿:不存在**。主进程一死,nettop 的 stdout 读端关闭,它下个采样周期(每秒)写 stdout 即吃 SIGPIPE 自杀。实测 SIGKILL 主进程后 nettop ~1s 内自动消失,无残留、无需主动 kill。
-- **nettop 崩溃自救:监督循环**。`supervise()` 解析当前 nettop 直到流断 → kill+wait 回收 → 退避(1s 指数到 30s 上限,上条若稳定存活过则重置)后重启。实测 SIGKILL nettop 子进程后,主进程 1s 内重启出新 nettop、数据流恢复;崩溃期间 Engine 靠存量连接 + GC 维持。
+- **CPU ~1%**:原 `-l 0` 持续流因 nettop `-x` 的 busy-spin 烧满核(~138%,与 `-s`/`-d`/`-p` 都无关);换单次快照轮询后 seecn 实测 **1.2%**、无常驻 nettop 进程。
+- **无孤儿**:轮询的 `nettop -l 1` 每次 ~40ms 自行退出,根本没有长驻子进程,孤儿问题不存在。
+- **崩溃自救**:某轮 `nettop -l 1` 失败只是本轮 `ERROR_BACKOFF`(5s)后重试,不影响后续轮次;期间 Engine 靠存量连接 + GC 维持。
+- **无 Claude 进程时**:`claude_pids` 空 → 不跑 nettop、把存量连接全 `Disconnect`,几乎零开销。
 
 ## 7. flyout — 状态栏浮层(已实现)
 

@@ -19,7 +19,7 @@ src/
   platform/
     mod.rs           平台 trait(ProcScanner / NetMonitor / TcpSnapshot)+ cfg 分发 + monitor_label / log_base_dir
     windows/         ETW(etw.rs)/ netstat2(tcptable)/ sysinfo(proc)/ WebView2 flyout
-    macos/           nettop 常驻流(net.rs)/ netstat2 / sysinfo / WKWebView flyout
+    macos/           nettop 单次快照轮询(net.rs)/ netstat2 / sysinfo / WKWebView flyout
 assets/flyout.html   内嵌 flyout 模板(两平台共用,window.seecnRender(json) 渲染)
 docs/                DESIGN.md(Win)/ macos-port-design.md(Mac)/ 调研笔记
 packaging/macos/     Info.plist(.app bundle,CI 打包用)
